@@ -1,0 +1,20 @@
+# pyproject.toml
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bess-arbitrage-analyzer"
+version = "1.0.0"
+description = "Mapeamento de restrições de geração e oportunidades de BESS via dados ONS/ANEEL"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "requests>=2.31.0",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "python-dateutil>=2.8.2",
+]
+
+[tool.setuptools.packages.find]
+include = ["config*", "models*", "data_collectors*", "analysis*", "visualization*"]

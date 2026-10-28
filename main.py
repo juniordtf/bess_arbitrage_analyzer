@@ -31,6 +31,7 @@ from config.settings import Settings
 from models.data_models import RegistroGeracao, RegistroPLD, TipoFonte
 from data_collectors.ons_collector import ONSDataCollector
 from data_collectors.aneel_collector import ANEELDataCollector
+from data_collectors.ccee_collector import CCEEDataCollector, CCEEDatasetUnavailableError
 from analysis.curtailment_analyzer import CurtailmentAnalyzer
 from analysis.price_spread_analyzer import PriceSpreadAnalyzer
 from analysis.bess_opportunity_finder import BESSOpportunityFinder
@@ -134,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         '--sensitivity', action='store_true',
         help="Executa análise de sensibilidade para a melhor oportunidade"
     )
+    parser.add_argument(
+        '--fonte-pld', type=str, default='ccee', choices=['ccee', 'ons'],
+        help="Fonte primária para dados de PLD. 'ccee' (recomendado, "
+            "fonte oficial) ou 'ons' (fallback direto, sem tentar CCEE)"
+    )
 
     return parser.parse_args()
 
@@ -189,16 +195,34 @@ def collect_generation_data(ons_collector: ONSDataCollector,
 
 
 def collect_pld_data(ons_collector: ONSDataCollector,
+                       ccee_collector: CCEEDataCollector,
                        data_inicio: datetime,
                        data_fim: datetime) -> List[RegistroPLD]:
-    """Coleta dados de PLD horário"""
-    logger.info("Coletando PLD horário...")
+    """
+    Coleta dados de PLD horário, priorizando a CCEE (fonte oficial
+    do índice) e usando o ONS como fallback secundário em caso de
+    indisponibilidade.
+    """
+    logger.info("Coletando PLD horário (fonte primária: CCEE)...")
+
+    try:
+        registros = ccee_collector.get_pld_horario(data_inicio, data_fim)
+        if registros:
+            logger.info(f"  -> {len(registros)} registros de PLD coletados via CCEE")
+            return registros
+        logger.warning("CCEE retornou lista vazia - tentando fallback via ONS")
+
+    except CCEEDatasetUnavailableError as e:
+        logger.warning(f"CCEE indisponível ({e}) - tentando fallback via ONS")
+    except Exception as e:
+        logger.error(f"Erro inesperado ao coletar PLD via CCEE: {e}", exc_info=True)
+
     try:
         registros = ons_collector.get_pld_horario(data_inicio, data_fim)
-        logger.info(f"  -> {len(registros)} registros de PLD coletados")
+        logger.info(f"  -> {len(registros)} registros de PLD coletados via ONS (fallback)")
         return registros
     except Exception as e:
-        logger.error(f"Erro ao coletar PLD: {e}", exc_info=True)
+        logger.error(f"Erro ao coletar PLD via ONS (fallback): {e}", exc_info=True)
         return []
 
 
@@ -407,19 +431,22 @@ def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
     data_inicio, data_fim = resolve_date_range(args)
     logger.info(f"Período de análise: {data_inicio.date()} até {data_fim.date()}")
 
-    # --- Inicialização dos coletores ---
     ons_collector = ONSDataCollector(cache_dir=args.cache_dir)
+    ccee_collector = CCEEDataCollector(cache_dir=args.cache_dir)
     aneel_collector = ANEELDataCollector(cache_dir=args.cache_dir)
 
-    # --- ETAPA 1: Coleta de dados ---
     logger.info("=" * 60)
-    logger.info("ETAPA 1/4: Coleta de dados ONS")
+    logger.info("ETAPA 1/4: Coleta de dados ONS (geração) + CCEE (PLD)")
     logger.info("=" * 60)
 
     registros_geracao = collect_generation_data(
         ons_collector, args.fontes, data_inicio, data_fim
     )
-    registros_pld = collect_pld_data(ons_collector, data_inicio, data_fim)
+    registros_pld = (
+        collect_pld_data(ons_collector, ccee_collector, data_inicio, data_fim)
+        if args.fonte_pld == 'ccee'
+        else collect_pld_data_ons_only(ons_collector, data_inicio, data_fim)
+    )
 
     if not validate_data_sufficiency(registros_geracao, registros_pld):
         return None
@@ -528,6 +555,18 @@ def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
 
     return resumo
 
+def collect_pld_data_ons_only(ons_collector: ONSDataCollector,
+                                 data_inicio: datetime,
+                                 data_fim: datetime) -> List[RegistroPLD]:
+    """Coleta PLD exclusivamente via ONS, sem tentar CCEE (uso explícito via --fonte-pld ons)"""
+    logger.info("Coletando PLD horário (fonte exclusiva: ONS, via --fonte-pld)...")
+    try:
+        registros = ons_collector.get_pld_horario(data_inicio, data_fim)
+        logger.info(f"  -> {len(registros)} registros de PLD coletados via ONS")
+        return registros
+    except Exception as e:
+        logger.error(f"Erro ao coletar PLD via ONS: {e}", exc_info=True)
+        return []
 
 # ======================================================================
 # VALIDAÇÃO DE AMBIENTE

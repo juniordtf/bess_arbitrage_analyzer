@@ -17,6 +17,7 @@ from config.settings import Settings
 from models.data_models import RegistroGeracao, RegistroPLD, TipoFonte
 from data_collectors.ons_collector import ONSDataCollector
 from data_collectors.aneel_collector import ANEELDataCollector
+from data_collectors.ccee_collector import CCEEDataCollector, CCEEDatasetUnavailableError
 from analysis.curtailment_analyzer import CurtailmentAnalyzer
 from analysis.price_spread_analyzer import PriceSpreadAnalyzer
 from analysis.bess_opportunity_finder import BESSOpportunityFinder
@@ -162,3 +163,39 @@ def filter_by_submercado(registros_geracao: List[RegistroGeracao],
     geracao_filtrada = [r for r in registros_geracao if r.submercado == submercado]
     pld_filtrado = [r for r in registros_pld if r.submercado == submercado]
     return geracao_filtrada, pld_filtrado
+
+
+@st.cache_resource
+def get_ccee_collector() -> CCEEDataCollector:
+    return CCEEDataCollector(cache_dir=Settings.CACHE_DIR)
+
+@st.cache_data(ttl=3600, show_spinner="Coletando dados de PLD da CCEE...")
+def load_pld_data(data_inicio: datetime, data_fim: datetime) -> List[RegistroPLD]:
+    """
+    Carrega dados de PLD horário, priorizando a CCEE (fonte oficial
+    do índice) e usando o ONS como fallback secundário em caso de
+    indisponibilidade - mesma lógica aplicada no main.py, mantendo
+    consistência entre o pipeline CLI e o dashboard interativo.
+    """
+    ccee_collector = get_ccee_collector()
+    ons_collector = get_ons_collector()
+
+    try:
+        registros = ccee_collector.get_pld_horario(data_inicio, data_fim)
+        if registros:
+            return registros
+        logger.warning("CCEE retornou lista vazia - tentando fallback via ONS")
+
+    except CCEEDatasetUnavailableError as e:
+        logger.warning(f"CCEE indisponível ({e}) - tentando fallback via ONS")
+        st.toast("⚠️ CCEE indisponível, usando ONS como fallback para PLD", icon="⚠️")
+    except Exception as e:
+        logger.error(f"Erro inesperado ao coletar PLD via CCEE: {e}")
+
+    try:
+        registros = ons_collector.get_pld_horario(data_inicio, data_fim)
+        return registros
+    except Exception as e:
+        logger.error(f"Erro ao coletar PLD via ONS (fallback): {e}")
+        st.error(f"❌ Erro crítico: PLD indisponível tanto na CCEE quanto no ONS: {e}")
+        return []

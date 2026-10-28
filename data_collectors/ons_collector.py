@@ -7,8 +7,10 @@ from typing import List, Optional, Dict
 import logging
 from pathlib import Path
 import time
+import unicodedata
 
 from config.settings import Settings
+from data_collectors.http_utils import use_system_certificates
 from models.data_models import RegistroGeracao, RegistroPLD, TipoFonte
 
 logger = logging.getLogger(__name__)
@@ -52,6 +54,7 @@ class ONSDataCollector:
         self.cache_dir = Path(cache_dir or Settings.CACHE_DIR)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.session = requests.Session()
+        use_system_certificates(self.session)
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 BESS-Arbitrage-Analyzer/1.0'
         })
@@ -64,18 +67,23 @@ class ONSDataCollector:
 
     def _download_ons_csv(self, dataset_name: str, year: int,
                            force_refresh: bool = False,
-                           max_retries: int = 3) -> pd.DataFrame:
+                           max_retries: int = 3,
+                           url: Optional[str] = None,
+                           cache_path: Optional[Path] = None) -> pd.DataFrame:
         """
         Baixa CSV do ONS com retry e fallback de encoding.
         Padrão de URL: {BASE}/{dataset}/{DATASET}_{ANO}.csv
         """
-        cache_path = self._get_cache_path(dataset_name, year)
+        cache_path = cache_path or self._get_cache_path(dataset_name, year)
 
         if cache_path.exists() and not force_refresh:
             logger.info(f"Carregando do cache: {cache_path}")
             return self._safe_read_csv(cache_path)
 
-        url = f"{Settings.ONS_BASE_URL}/{dataset_name}/{dataset_name.upper()}_{year}.csv"
+        url = url or (
+            f"{Settings.ONS_BASE_URL}/{dataset_name}/"
+            f"{dataset_name.upper()}_{year}.csv"
+        )
 
         for attempt in range(1, max_retries + 1):
             try:
@@ -158,33 +166,77 @@ class ONSDataCollector:
     # ------------------------------------------------------------------
     # Geração por fonte
     # ------------------------------------------------------------------
-    def get_geracao_por_fonte(self, fonte: TipoFonte,
-                               data_inicio: datetime,
-                               data_fim: datetime) -> List[RegistroGeracao]:
-        """Busca dados de geração por fonte e período"""
-
-        dataset_map = {
-            TipoFonte.EOLICA: "geracao_eolica",
-            TipoFonte.SOLAR: "geracao_solar",
-            TipoFonte.HIDRAULICA: "geracao_hidraulica",
-            TipoFonte.TERMICA: "geracao_termica",
+    def get_geracao_por_fonte(self,
+                                fonte: TipoFonte,
+                                data_inicio: datetime,
+                                data_fim: datetime) -> List[RegistroGeracao]:
+        """Busca geração por fonte usando os CSVs atuais do ONS."""
+        tipos_usina = {
+            TipoFonte.EOLICA: {"EOLICA", "EOLIELETRICA"},
+            TipoFonte.SOLAR: {"FOTOVOLTAICA"},
+            TipoFonte.HIDRAULICA: {"HIDROELETRICA"},
+            TipoFonte.TERMICA: {"TERMICA"},
         }
-
-        dataset_key = dataset_map.get(fonte)
-        if not dataset_key:
-            logger.warning(f"Fonte {fonte} não suportada")
+        tipo_usina = tipos_usina.get(fonte)
+        if tipo_usina is None:
+            logger.warning(f"Fonte {fonte.value} não suportada pelo dataset do ONS")
             return []
 
         registros = []
-        anos = range(data_inicio.year, data_fim.year + 1)
+        for ano in range(data_inicio.year, data_fim.year + 1):
+            if ano < 2022:
+                periodos = [(None, None)]
+            else:
+                primeiro_mes = data_inicio.month if ano == data_inicio.year else 1
+                ultimo_mes = data_fim.month if ano == data_fim.year else 12
+                periodos = [(mes, mes) for mes in range(primeiro_mes, ultimo_mes + 1)]
 
-        for ano in anos:
-            df = self._download_ons_csv(self.DATASETS[dataset_key], ano)
-            if df.empty:
-                continue
-            registros.extend(
-                self._parse_geracao_df(df, fonte, data_inicio, data_fim)
-            )
+            for mes, _ in periodos:
+                if mes is None:
+                    arquivo = f"GERACAO_USINA-2_{ano}.csv"
+                    cache_path = self.cache_dir / f"geracao_usina_2_ho_{ano}.csv"
+                else:
+                    arquivo = f"GERACAO_USINA-2_{ano}_{mes:02d}.csv"
+                    cache_path = (
+                        self.cache_dir / f"geracao_usina_2_ho_{ano}_{mes:02d}.csv"
+                    )
+
+                url = (
+                    f"{Settings.ONS_BASE_URL}/geracao_usina_2_ho/{arquivo}"
+                )
+                df = self._download_ons_csv(
+                    "geracao_usina_2_ho",
+                    ano,
+                    url=url,
+                    cache_path=cache_path,
+                )
+                if df.empty:
+                    continue
+
+                type_column = next(
+                    (
+                        column for column in df.columns
+                        if column.strip().lower() == "nom_tipousina"
+                    ),
+                    None,
+                )
+                if type_column is None:
+                    logger.warning(
+                        f"Coluna nom_tipousina ausente no dataset de geração {ano}"
+                    )
+                    continue
+
+                normalized_types = df[type_column].astype(str).map(
+                    lambda value: unicodedata.normalize("NFKD", value)
+                    .encode("ascii", "ignore")
+                    .decode("ascii")
+                    .strip()
+                    .upper()
+                )
+                df_fonte = df.loc[normalized_types.isin(tipo_usina)]
+                registros.extend(
+                    self._parse_geracao_df(df_fonte, fonte, data_inicio, data_fim)
+                )
 
         logger.info(f"{fonte.value}: {len(registros)} registros no período")
         return registros
@@ -246,21 +298,13 @@ class ONSDataCollector:
     def get_pld_horario(self, data_inicio: datetime,
                          data_fim: datetime) -> List[RegistroPLD]:
         """
-        Busca PLD horário por submercado.
+        O ONS não publica mais o dataset de PLD horário em seu catálogo.
+        O PLD deve ser obtido pela fonte oficial da CCEE.
         """
-        registros = []
-        anos = range(data_inicio.year, data_fim.year + 1)
-
-        for ano in anos:
-            df = self._download_ons_csv(self.DATASETS['pld_horario'], ano)
-            if df.empty:
-                continue
-            registros.extend(
-                self._parse_pld_df(df, data_inicio, data_fim)
-            )
-
-        logger.info(f"PLD: {len(registros)} registros no período")
-        return registros
+        raise ONSDatasetUnavailableError(
+            "O ONS não disponibiliza PLD horário no catálogo atual. "
+            "Obtenha os dados pela CCEE."
+        )
 
     def _parse_pld_df(self, df: pd.DataFrame,
                        data_inicio: datetime,
@@ -479,7 +523,6 @@ class ONSDataCollector:
             for f in self.cache_dir.glob("*.csv"):
                 f.unlink()
             logger.info("Todo o cache foi limpo")
-
 
 class ONSDatasetUnavailableError(Exception):
     """Levantada quando nenhum dataset pôde ser baixado/parseado para o período"""

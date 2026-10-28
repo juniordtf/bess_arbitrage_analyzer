@@ -46,6 +46,7 @@ from models.data_models import (
 )
 
 from data_collectors.ons_collector import ONSDataCollector, ONSDatasetUnavailableError
+from data_collectors.ccee_collector import CCEEDataCollector, CCEEDatasetUnavailableError
 from data_collectors.aneel_collector import ANEELDataCollector, ANEELDatasetUnavailableError
 
 from analysis.curtailment_analyzer import CurtailmentAnalyzer
@@ -65,10 +66,8 @@ __all__ = [
     # Collectors
     "ONSDataCollector",
     "ONSDatasetUnavailableError",
+    "CCEEDataCollector",
+    "CCEEDatasetUnavailableError",
     "ANEELDataCollector",
     "ANEELDatasetUnavailableError",
-    # Analysis
-    "CurtailmentAnalyzer",
-    "PriceSpreadAnalyzer",
-    "BESSOpportunityFinder",
 ]

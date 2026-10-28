@@ -1,0 +1,153 @@
+# ============================================================
+# BESS Arbitrage Analyzer - .gitignore
+# ============================================================
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ------------------------------------------------------------
+# Ambientes virtuais
+# ------------------------------------------------------------
+venv/
+env/
+ENV/
+.venv/
+.env/
+env.bak/
+venv.bak/
+
+# ------------------------------------------------------------
+# Variáveis de ambiente / segredos
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.toml
+.streamlit/secrets.toml
+
+# ------------------------------------------------------------
+# Dados do projeto - Cache local (ONS/ANEEL)
+# ------------------------------------------------------------
+cache/
+data_cache/
+*.cache
+
+# ------------------------------------------------------------
+# Outputs gerados pelo pipeline (relatórios, CSVs, logs)
+# ------------------------------------------------------------
+output/
+outputs/
+*.log
+logs/
+
+# Relatórios e exports específicos gerados em runtime
+relatorio_bess_*.json
+oportunidades_bess_*.csv
+sensibilidade_*.csv
+simulacao_bess_*.csv
+
+# ------------------------------------------------------------
+# Datasets brutos (caso sejam baixados localmente para testes)
+# ------------------------------------------------------------
+*.csv
+*.xlsx
+*.parquet
+!tests/fixtures/**/*.csv
+!tests/fixtures/**/*.xlsx
+
+# ------------------------------------------------------------
+# Jupyter Notebooks (checkpoints e saídas)
+# ------------------------------------------------------------
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ------------------------------------------------------------
+# Streamlit
+# ------------------------------------------------------------
+.streamlit/
+!.streamlit/config.toml
+
+# ------------------------------------------------------------
+# Testes e Cobertura
+# ------------------------------------------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.tox/
+.nox/
+
+# ------------------------------------------------------------
+# Type checking / Linters
+# ------------------------------------------------------------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pylint.d/
+
+# ------------------------------------------------------------
+# IDEs e editores
+# ------------------------------------------------------------
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ------------------------------------------------------------
+# Sistema Operacional
+# ------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------
+# Build de pacote (pyproject.toml / setuptools)
+# ------------------------------------------------------------
+*.egg-info/
+pip-wheel-metadata/
+
+# ------------------------------------------------------------
+# Arquivos temporários diversos
+# ------------------------------------------------------------
+*.tmp
+*.bak
+*.orig
+tmp/
+temp/

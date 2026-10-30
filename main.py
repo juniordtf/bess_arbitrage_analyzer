@@ -304,11 +304,20 @@ def print_console_summary(resumo: dict):
     print(" RESUMO EXECUTIVO - OPORTUNIDADES DE BESS PARA ARBITRAGEM DE ENERGIA")
     print("=" * 80)
 
+    if resumo.get('aviso_transparencia'):
+        print(f"\n📌 FONTE DE DADOS: {resumo['aviso_transparencia']}\n")
+
     resumo_exec = resumo.get('resumo_executivo', {})
 
     if resumo_exec.get('total_oportunidades_identificadas', 0) == 0:
         print("\n⚠️  Nenhuma oportunidade identificada com os critérios atuais.")
-        print("    Considere ajustar --min-score ou expandir o período de análise.\n")
+        if resumo.get('fonte_dados_primaria') == 'NENHUMA':
+            print(
+                "    ❗ Isso pode ser devido à INDISPONIBILIDADE do dataset "
+                "confirmado (COFF) para o período, e não à ausência real "
+                "de curtailment. Considere expandir o período ou verificar "
+                "conectividade com o portal de dados do ONS.\n"
+            )
         return
 
     print(f"\n📊 Total de oportunidades identificadas: "
@@ -425,8 +434,48 @@ def _json_serializer(obj):
 # ======================================================================
 # PIPELINE PRINCIPAL
 # ======================================================================
+def collect_coff_data(ons_collector: ONSDataCollector,
+                        fontes: List[str],
+                        data_inicio: datetime,
+                        data_fim: datetime) -> Dict[str, List]:
+    """
+    Coleta dados REAIS de restrição COFF para eólica e solar (quando
+    disponíveis). Esta é a fonte primária e correta de curtailment -
+    deve ser chamada antes de qualquer fallback para proxy de PLD.
+    """
+    resultado = {'eolica': [], 'solar': []}
+
+    if 'EOLICA' in fontes:
+        logger.info("Coletando restrição COFF real - Eólica...")
+        try:
+            resultado['eolica'] = ons_collector.get_restricao_coff(
+                TipoFonte.EOLICA, data_inicio, data_fim
+            )
+            logger.info(f"  -> {len(resultado['eolica'])} registros reais de COFF eólica")
+        except Exception as e:
+            logger.warning(
+                f"Dataset COFF eólica indisponível ({e}) - análise cairá "
+                f"para fallback (geração programada/verificada ou proxy PLD)"
+            )
+
+    if 'SOLAR' in fontes:
+        logger.info("Coletando restrição COFF real - Solar...")
+        try:
+            resultado['solar'] = ons_collector.get_restricao_coff(
+                TipoFonte.SOLAR, data_inicio, data_fim
+            )
+            logger.info(f"  -> {len(resultado['solar'])} registros reais de COFF solar")
+        except Exception as e:
+            logger.warning(
+                f"Dataset COFF solar indisponível ({e}) - análise cairá "
+                f"para fallback (geração programada/verificada ou proxy PLD)"
+            )
+
+    return resultado
+
+
 def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
-    """Executa o pipeline completo de análise"""
+    """Executa o pipeline completo de análise (versão atualizada com COFF)"""
 
     data_inicio, data_fim = resolve_date_range(args)
     logger.info(f"Período de análise: {data_inicio.date()} até {data_fim.date()}")
@@ -435,26 +484,43 @@ def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
     ccee_collector = CCEEDataCollector(cache_dir=args.cache_dir)
     aneel_collector = ANEELDataCollector(cache_dir=args.cache_dir)
 
+    # --- ETAPA 1: Coleta de dados REAIS de curtailment (COFF) ---
     logger.info("=" * 60)
-    logger.info("ETAPA 1/4: Coleta de dados ONS (geração) + CCEE (PLD)")
+    logger.info("ETAPA 1/5: Coleta de dados REAIS de curtailment (ONS - COFF)")
+    logger.info("=" * 60)
+
+    dados_coff = collect_coff_data(ons_collector, args.fontes, data_inicio, data_fim)
+
+    # --- ETAPA 2: Coleta de dados complementares (geração + PLD) ---
+    logger.info("=" * 60)
+    logger.info("ETAPA 2/5: Coleta de dados complementares (geração ONS + PLD CCEE)")
     logger.info("=" * 60)
 
     registros_geracao = collect_generation_data(
         ons_collector, args.fontes, data_inicio, data_fim
     )
-    registros_pld = (
-        collect_pld_data(ons_collector, ccee_collector, data_inicio, data_fim)
-        if args.fonte_pld == 'ccee'
-        else collect_pld_data_ons_only(ons_collector, data_inicio, data_fim)
+    registros_pld = collect_pld_data(
+        ons_collector, ccee_collector, data_inicio, data_fim
     )
 
     if not validate_data_sufficiency(registros_geracao, registros_pld):
         return None
 
+    tem_coff = bool(dados_coff['eolica'] or dados_coff['solar'])
+    if not tem_coff:
+        logger.warning(
+            "⚠️ ATENÇÃO: Nenhum dado real de restrição COFF disponível "
+            "para o período solicitado. A análise de curtailment usará "
+            "fallback (geração programada/verificada), que é menos "
+            "granular que o dado oficial de razão de corte. Isso NÃO "
+            "significa ausência de curtailment real - apenas que o "
+            "dado específico não foi encontrado no portal do ONS."
+        )
+
     df_perfil_aneel = None
     if not args.skip_aneel:
         logger.info("=" * 60)
-        logger.info("ETAPA 1.5/4: Coleta de dados ANEEL")
+        logger.info("ETAPA 2.5/5: Coleta de dados ANEEL")
         logger.info("=" * 60)
         df_perfil_aneel = collect_aneel_profile(aneel_collector, args.force_refresh)
 
@@ -462,44 +528,55 @@ def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
     registros_geracao, registros_pld = filter_by_submercado(
         registros_geracao, registros_pld, args.submercado
     )
+    if args.submercado:
+        dados_coff['eolica'] = [
+            r for r in dados_coff['eolica'] if r.submercado == args.submercado
+        ]
+        dados_coff['solar'] = [
+            r for r in dados_coff['solar'] if r.submercado == args.submercado
+        ]
 
-    # --- ETAPA 2: Análise de curtailment ---
+    # --- ETAPA 3: Análise consolidada de curtailment ---
     logger.info("=" * 60)
-    logger.info("ETAPA 2/4: Análise de curtailment e excesso de geração")
+    logger.info("ETAPA 3/5: Análise consolidada de curtailment")
     logger.info("=" * 60)
 
     curtailment_analyzer = CurtailmentAnalyzer()
 
-    ranking_curtailment = curtailment_analyzer.rank_submercados_por_potencial(
-        registros_geracao, registros_pld
+    resultado_curtailment = curtailment_analyzer.analyze_curtailment_consolidado(
+        registros_coff_eolica=dados_coff['eolica'],
+        registros_coff_solar=dados_coff['solar'],
+        registros_geracao=registros_geracao,
+        registros_pld=registros_pld,
     )
-    if not ranking_curtailment.empty:
-        logger.info("\nRanking de submercados por potencial de curtailment:\n" +
-                     ranking_curtailment[
-                         ['submercado', 'score_potencial_bess',
-                          'energia_cortada_total_mwh', 'spread_medio_pld']
-                     ].to_string(index=False))
 
-    # --- ETAPA 3: Análise de spread de preços ---
+    aviso = curtailment_analyzer.gerar_aviso_transparencia(resultado_curtailment)
+    logger.info(f"Transparência de fonte: {aviso}")
+    print(f"\n{'='*80}\n{aviso}\n{'='*80}\n")
+
+    if not resultado_curtailment['resumo_por_razao'].empty:
+        logger.info(
+            "\nResumo de curtailment REAL por razão/submercado/fonte:\n" +
+            resultado_curtailment['resumo_por_razao'].to_string(index=False)
+        )
+
+    # --- ETAPA 4: Análise de spread de preços ---
     logger.info("=" * 60)
-    logger.info("ETAPA 3/4: Análise de spread de preços (PLD)")
+    logger.info("ETAPA 4/5: Análise de spread de preços (PLD)")
     logger.info("=" * 60)
 
-    spread_analyzer = PriceSpreadAnalyzer(
-        eficiencia_bess=args.eficiencia
-    )
+    spread_analyzer = PriceSpreadAnalyzer(eficiencia_bess=args.eficiencia)
 
     ranking_spread = spread_analyzer.rank_submercados_por_spread(registros_pld)
     if not ranking_spread.empty:
         logger.info("\nRanking de submercados por spread de preço:\n" +
                      ranking_spread[
-                         ['submercado', 'score_spread', 'spread_medio_rs_mwh',
-                          'consistencia_horario_pct']
+                         ['submercado', 'score_spread', 'spread_medio_rs_mwh']
                      ].to_string(index=False))
 
-    # --- ETAPA 4: Consolidação de oportunidades BESS ---
+    # --- ETAPA 5: Consolidação de oportunidades BESS ---
     logger.info("=" * 60)
-    logger.info("ETAPA 4/4: Identificação de oportunidades de BESS")
+    logger.info("ETAPA 5/5: Identificação de oportunidades de BESS")
     logger.info("=" * 60)
 
     opportunity_finder = BESSOpportunityFinder(
@@ -512,45 +589,42 @@ def run_pipeline(args: argparse.Namespace) -> Optional[dict]:
     oportunidades = opportunity_finder.find_opportunities(
         registros_geracao=registros_geracao,
         registros_pld=registros_pld,
+        registros_coff_eolica=dados_coff['eolica'],
+        registros_coff_solar=dados_coff['solar'],
         df_perfil_aneel=df_perfil_aneel,
         min_score_corte=args.min_score,
     )
 
     if not oportunidades:
         logger.warning(
-            "Nenhuma oportunidade de BESS identificada com os critérios atuais "
-            f"(min_score={args.min_score}). Considere relaxar os filtros ou "
-            "expandir o período de análise."
+            f"Nenhuma oportunidade de BESS identificada com os critérios "
+            f"atuais (min_score={args.min_score})."
         )
         return {
             'resumo_executivo': {'total_oportunidades_identificadas': 0},
             'ranking_completo': [],
             'top_5_analise_detalhada': [],
+            'aviso_transparencia': aviso,
+            'fonte_dados_primaria': resultado_curtailment['fonte_dados_primaria'],
         }
 
     resumo = opportunity_finder.generate_executive_report(oportunidades)
+    resumo['aviso_transparencia'] = aviso
+    resumo['fonte_dados_primaria'] = resultado_curtailment['fonte_dados_primaria']
+
     df_oportunidades = opportunity_finder.export_opportunities_to_dataframe(oportunidades)
 
-    # --- Exportação de arquivos ---
     caminhos_exportados = export_results(resumo, df_oportunidades, args.output)
     resumo['_output_path'] = caminhos_exportados['json']
 
-    # --- Análise de sensibilidade (opcional) ---
     if args.sensitivity and oportunidades:
-        logger.info("=" * 60)
-        logger.info("EXTRA: Análise de sensibilidade (melhor oportunidade)")
-        logger.info("=" * 60)
-
         melhor_oportunidade = oportunidades[0]
         df_sensitivity = opportunity_finder.sensitivity_analysis(melhor_oportunidade)
-
         sensitivity_csv_path = Path(args.output) / (
             f"sensibilidade_{melhor_oportunidade.submercado}_"
             f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         )
         df_sensitivity.to_csv(sensitivity_csv_path, index=False, sep=';', encoding='utf-8-sig')
-        logger.info(f"Análise de sensibilidade salva: {sensitivity_csv_path}")
-
         print_sensitivity_summary(df_sensitivity, melhor_oportunidade.submercado)
 
     return resumo

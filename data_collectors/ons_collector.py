@@ -8,10 +8,11 @@ import logging
 from pathlib import Path
 import time
 import unicodedata
+import re
 
 from config.settings import Settings
 from data_collectors.http_utils import use_system_certificates
-from models.data_models import RegistroGeracao, RegistroPLD, TipoFonte
+from models.data_models import RegistroGeracao, RegistroPLD, RestricaoCOFF, RazaoRestricaoCOFF, TipoFonte
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +389,315 @@ class ONSDataCollector:
             return pd.DataFrame()
 
         return pd.concat(frames, ignore_index=True)
+
+    _COFF_DATASET_IDS = {
+        TipoFonte.EOLICA: "restricao_coff_eolica_detail",
+        TipoFonte.SOLAR: "restricao_coff_fotovoltaica_detail",
+    }
+    _COFF_CATALOG_URL = "https://dados.ons.org.br/api/3/action/package_show"
+    _COFF_COLUMNS = {
+        "din_instante", "data_hora", "timestamp",
+        "nom_usina", "nom_conjuntousina", "usina",
+        "id_subsistema", "nom_subsistema", "submercado",
+        "flg_geracaorestrita", "val_geracaoestimada",
+        "val_geracaoverificada", "val_geracaoreferenciafinal",
+        "val_geracaolimitada", "val_potenciarestringida",
+        "potencia_restringida", "val_geracaodisponivel",
+        "nom_razaorestricao", "razao_restricao",
+        "cod_razaorestricao", "nom_motivo",
+    }
+
+    def get_restricao_coff(self,
+                              fonte: TipoFonte,
+                              data_inicio: datetime,
+                              data_fim: datetime) -> List[RestricaoCOFF]:
+        """
+        Obtém dados REAIS de restrição de geração (curtailment) do
+        ONS, com razão de corte classificada oficialmente
+        (Energética, Elétrica, Confiabilidade).
+
+        Esta é a fonte PRIMÁRIA e correta para medir curtailment -
+        o uso de PLD como proxy (ver CurtailmentAnalyzer.detect_oversupply_events)
+        deve ser tratado apenas como sinal complementar de contexto
+        econômico, nunca como substituto deste dado.
+
+        Args:
+            fonte: TipoFonte.EOLICA ou TipoFonte.SOLAR (únicas fontes
+                   com dataset de restrição COFF público no momento)
+            data_inicio: início do período
+            data_fim: fim do período
+
+        Returns:
+            Lista de RestricaoCOFF com granularidade por usina/hora
+        """
+        if fonte not in (TipoFonte.EOLICA, TipoFonte.SOLAR):
+            logger.warning(
+                f"Dataset de restrição COFF não disponível publicamente "
+                f"para a fonte {fonte.value}. Retornando lista vazia."
+            )
+            return []
+
+        recursos = self._listar_recursos_coff(fonte)
+        registros = []
+        mes_atual = datetime(data_inicio.year, data_inicio.month, 1)
+        mes_final = datetime(data_fim.year, data_fim.month, 1)
+
+        while mes_atual <= mes_final:
+            url = recursos.get((mes_atual.year, mes_atual.month))
+            if url is None:
+                logger.warning(
+                    f"Recurso COFF {fonte.value} não publicado para "
+                    f"{mes_atual:%Y-%m}"
+                )
+            else:
+                caminho = self._baixar_dataset_coff(
+                    fonte, mes_atual.year, mes_atual.month, url
+                )
+                leitor = pd.read_csv(
+                    caminho,
+                    sep=";",
+                    usecols=lambda coluna: coluna.strip().lower() in self._COFF_COLUMNS,
+                    chunksize=100_000,
+                    low_memory=False,
+                )
+                for bloco in leitor:
+                    registros.extend(
+                        self._converter_para_registros_coff(
+                            bloco, fonte, data_inicio, data_fim
+                        )
+                    )
+
+            if mes_atual.month == 12:
+                mes_atual = datetime(mes_atual.year + 1, 1, 1)
+            else:
+                mes_atual = datetime(mes_atual.year, mes_atual.month + 1, 1)
+
+        logger.info(
+            f"COFF {fonte.value}: {len(registros)} registros de restrição "
+            f"no período {data_inicio.date()} - {data_fim.date()}"
+        )
+        return registros
+
+    def _listar_recursos_coff(self, fonte: TipoFonte) -> Dict[tuple, str]:
+        """Descobre no CKAN os CSVs mensais publicados para a fonte."""
+        dataset_id = self._COFF_DATASET_IDS[fonte]
+        resposta = self.session.get(
+            self._COFF_CATALOG_URL,
+            params={"id": dataset_id},
+            timeout=60,
+        )
+        resposta.raise_for_status()
+        payload = resposta.json()
+        if not payload.get("success"):
+            raise ONSDatasetUnavailableError(
+                f"Catálogo CKAN do ONS não encontrou {dataset_id}: "
+                f"{payload.get('error', 'resposta sem detalhes')}"
+            )
+
+        recursos = {}
+        for recurso in payload.get("result", {}).get("resources", []):
+            if str(recurso.get("format", "")).upper() != "CSV":
+                continue
+            url = recurso.get("url")
+            if not url:
+                continue
+            correspondencia = re.search(
+                r"_(20\d{2})_(0[1-9]|1[0-2])\.csv(?:$|\?)",
+                url,
+                flags=re.IGNORECASE,
+            )
+            if correspondencia:
+                ano, mes = map(int, correspondencia.groups())
+                recursos[(ano, mes)] = url
+        return recursos
+
+    def _baixar_dataset_coff(self,
+                               fonte: TipoFonte,
+                               ano: int,
+                               mes: int,
+                               url: str) -> Path:
+        """Baixa (ou recupera do cache) o CSV mensal de restrição COFF."""
+        cache_path = self.cache_dir / f"coff_{fonte.value.lower()}_{ano}_{mes:02d}.csv"
+
+        if cache_path.exists():
+            idade_horas = (time.time() - cache_path.stat().st_mtime) / 3600
+            mes_vigente = (ano, mes) == (datetime.now().year, datetime.now().month)
+            ttl_horas = 12 if mes_vigente else 24 * 30
+
+            if idade_horas < ttl_horas:
+                logger.info(f"Usando cache local para COFF {fonte.value} {ano}")
+                return cache_path
+
+        caminho_temporario = cache_path.with_suffix(".csv.part")
+        for tentativa in range(1, 4):
+            try:
+                logger.info(
+                    f"Baixando restrição COFF {fonte.value} {ano}-{mes:02d} "
+                    f"(tentativa {tentativa}/3)"
+                )
+                with self.session.get(url, timeout=180, stream=True) as resp:
+                    resp.raise_for_status()
+                    with caminho_temporario.open("wb") as arquivo:
+                        for bloco in resp.iter_content(chunk_size=1024 * 1024):
+                            if bloco:
+                                arquivo.write(bloco)
+                caminho_temporario.replace(cache_path)
+                return cache_path
+            except requests.RequestException as e:
+                logger.warning(f"Falha na tentativa {tentativa}: {e}")
+                caminho_temporario.unlink(missing_ok=True)
+                if tentativa == 3:
+                    raise ONSDatasetUnavailableError(
+                        f"Não foi possível baixar restrição COFF {fonte.value} "
+                        f"{ano}-{mes:02d}: {e}"
+                    ) from e
+                time.sleep(2 ** tentativa)
+
+        raise ONSDatasetUnavailableError(
+            f"Não foi possível baixar restrição COFF {fonte.value} {ano}-{mes:02d}"
+        )
+
+    def _converter_para_registros_coff(self,
+                                          df: pd.DataFrame,
+                                          fonte: TipoFonte,
+                                          data_inicio: datetime,
+                                          data_fim: datetime) -> List[RestricaoCOFF]:
+        """
+        Normaliza variantes do schema COFF, incluindo os CSVs mensais
+        atuais com geração estimada/verificada e flag de restrição.
+        """
+        df = df.copy()
+        df.columns = [c.strip().lower() for c in df.columns]
+
+        def find_column(*nomes):
+            return next((nome for nome in nomes if nome in df.columns), None)
+
+        timestamp_col = find_column("din_instante", "data_hora", "timestamp")
+        usina_col = find_column("nom_usina", "nom_conjuntousina", "usina")
+        submercado_col = find_column(
+            "id_subsistema", "nom_subsistema", "submercado"
+        )
+        if not timestamp_col or not usina_col or not submercado_col:
+            raise ValueError(
+                f"Schema COFF inesperado para {fonte.value}: "
+                f"colunas disponíveis {list(df.columns)}"
+            )
+
+        df["timestamp"] = pd.to_datetime(df[timestamp_col], errors="coerce")
+        df = df.dropna(subset=["timestamp"])
+        df = df[
+            (df["timestamp"] >= pd.Timestamp(data_inicio))
+            & (df["timestamp"] <= pd.Timestamp(data_fim))
+        ].copy()
+        if df.empty:
+            return []
+
+        flag_col = find_column("flg_geracaorestrita")
+        if flag_col:
+            flags = df[flag_col].astype(str).str.strip().str.upper().isin(
+                {"1", "S", "SIM", "TRUE", "T"}
+            )
+        else:
+            flags = pd.Series(True, index=df.index)
+
+        estimada_col = find_column(
+            "val_geracaoestimada", "val_geracaoreferenciafinal"
+        )
+        verificada_col = find_column("val_geracaoverificada")
+        limitada_col = find_column(
+            "val_geracaolimitada", "val_potenciarestringida",
+            "potencia_restringida",
+        )
+        disponivel_col = find_column("val_geracaodisponivel")
+        if estimada_col and verificada_col:
+            potencia_restringida = (
+                pd.to_numeric(df[estimada_col], errors="coerce")
+                - pd.to_numeric(df[verificada_col], errors="coerce")
+            ).clip(lower=0)
+        elif disponivel_col and limitada_col:
+            potencia_restringida = (
+                pd.to_numeric(df[disponivel_col], errors="coerce")
+                - pd.to_numeric(df[limitada_col], errors="coerce")
+            ).clip(lower=0)
+        elif limitada_col:
+            potencia_restringida = pd.to_numeric(
+                df[limitada_col], errors="coerce"
+            ).clip(lower=0)
+        else:
+            raise ValueError(
+                f"Schema COFF inesperado para {fonte.value}: "
+                "sem colunas de geração para calcular a potência restringida"
+            )
+
+        df["potencia_restringida_mw"] = potencia_restringida
+        df = df[flags & df["potencia_restringida_mw"].gt(0)].copy()
+        if df.empty:
+            return []
+
+        razao_col = find_column(
+            "nom_razaorestricao", "razao_restricao",
+            "cod_razaorestricao", "nom_motivo",
+        )
+        if razao_col:
+            df["razao_normalizada"] = self._normalizar_razao_restricao(
+                df[razao_col]
+            )
+        else:
+            df["razao_normalizada"] = RazaoRestricaoCOFF.OUTRA.value
+
+        geracao_disponivel = (
+            pd.to_numeric(df[estimada_col], errors="coerce")
+            if estimada_col else (
+                pd.to_numeric(df[disponivel_col], errors="coerce")
+                if disponivel_col else pd.Series(np.nan, index=df.index)
+            )
+        )
+
+        registros = []
+        for indice, row in df.iterrows():
+            registros.append(RestricaoCOFF(
+                timestamp=row["timestamp"],
+                usina=str(row[usina_col]),
+                submercado=self._normalize_submercado(row[submercado_col]),
+                fonte=fonte,
+                potencia_restringida_mw=float(row["potencia_restringida_mw"]),
+                razao_restricao=RazaoRestricaoCOFF(row["razao_normalizada"]),
+                geracao_disponivel_mw=(
+                    float(geracao_disponivel.loc[indice])
+                    if pd.notna(geracao_disponivel.loc[indice]) else None
+                ),
+                intervalo_horas=0.5,
+            ))
+        return registros
+
+    @staticmethod
+    def _normalizar_razao_restricao(serie: pd.Series) -> pd.Series:
+        """
+        Normaliza os valores de razão de restrição publicados pelo ONS
+        (que variam em capitalização/acentuação ao longo dos anos) para
+        o enum interno RazaoRestricaoCOFF.
+        """
+        mapeamento = {
+            'ENERGETICA': RazaoRestricaoCOFF.ENERGETICA.value,
+            'ENERGÉTICA': RazaoRestricaoCOFF.ENERGETICA.value,
+            'RESTRICAO ENERGETICA': RazaoRestricaoCOFF.ENERGETICA.value,
+            'ELETRICA': RazaoRestricaoCOFF.ELETRICA.value,
+            'ELÉTRICA': RazaoRestricaoCOFF.ELETRICA.value,
+            'RESTRICAO ELETRICA': RazaoRestricaoCOFF.ELETRICA.value,
+            'RESTRICAO DE TRANSMISSAO': RazaoRestricaoCOFF.ELETRICA.value,
+            'CONFIABILIDADE': RazaoRestricaoCOFF.CONFIABILIDADE.value,
+            'SEGURANCA': RazaoRestricaoCOFF.CONFIABILIDADE.value,
+            'SEGURANÇA': RazaoRestricaoCOFF.CONFIABILIDADE.value,
+        }
+
+        serie_normalizada = (
+            serie.astype(str).str.strip().str.upper()
+            .str.normalize('NFKD').str.encode('ascii', errors='ignore').str.decode('utf-8')
+        )
+
+        return serie_normalizada.map(
+            lambda v: mapeamento.get(v, RazaoRestricaoCOFF.OUTRA.value)
+        )
 
     # ------------------------------------------------------------------
     # Carga verificada

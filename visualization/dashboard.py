@@ -28,7 +28,7 @@ from config.settings import Settings
 from models.data_models import TipoFonte
 
 from visualization.data_loader import (
-    load_generation_data, load_pld_data, load_aneel_profile,
+    load_generation_data, load_coff_data, load_pld_data, load_aneel_profile,
     convert_registros_to_df, convert_pld_to_df, filter_by_submercado,
     get_curtailment_analyzer, get_spread_analyzer, get_opportunity_finder,
 )
@@ -139,20 +139,40 @@ def _carregar_dados_completos(params: dict):
     registros_geracao = load_generation_data(
         params['fontes'], params['data_inicio'], params['data_fim']
     )
+    registros_coff_eolica = (
+        load_coff_data('EOLICA', params['data_inicio'], params['data_fim'])
+        if 'EOLICA' in params['fontes'] else []
+    )
+    registros_coff_solar = (
+        load_coff_data('SOLAR', params['data_inicio'], params['data_fim'])
+        if 'SOLAR' in params['fontes'] else []
+    )
     registros_pld = load_pld_data(params['data_inicio'], params['data_fim'])
 
     df_perfil_aneel = pd.DataFrame()
     if params['incluir_aneel']:
         df_perfil_aneel = load_aneel_profile()
 
-    return registros_geracao, registros_pld, df_perfil_aneel
+    return (
+        registros_geracao,
+        registros_coff_eolica,
+        registros_coff_solar,
+        registros_pld,
+        df_perfil_aneel,
+    )
 
 
 def carregar_dados(params: dict):
     """Carrega dados com spinner visível e tratamento de erro amigável"""
     with st.spinner("🔍 Coletando e processando dados do ONS/ANEEL..."):
         try:
-            registros_geracao, registros_pld, df_perfil_aneel = _carregar_dados_completos(params)
+            (
+                registros_geracao,
+                registros_coff_eolica,
+                registros_coff_solar,
+                registros_pld,
+                df_perfil_aneel,
+            ) = _carregar_dados_completos(params)
         except Exception as e:
             st.error(f"❌ Erro ao carregar dados: {e}")
             st.stop()
@@ -169,12 +189,31 @@ def carregar_dados(params: dict):
         registros_geracao, registros_pld, params['submercado']
     )
 
-    return registros_geracao_f, registros_pld_f, df_perfil_aneel
+    registros_coff_eolica_f = [
+        r for r in registros_coff_eolica
+        if params['submercado'] in (None, 'TODOS')
+        or r.submercado == params['submercado']
+    ]
+    registros_coff_solar_f = [
+        r for r in registros_coff_solar
+        if params['submercado'] in (None, 'TODOS')
+        or r.submercado == params['submercado']
+    ]
+
+    return (
+        registros_geracao_f,
+        registros_coff_eolica_f,
+        registros_coff_solar_f,
+        registros_pld_f,
+        df_perfil_aneel,
+    )
 
 # ======================================================================
 # ABA 1: VISÃO GERAL
 # ======================================================================
-def render_tab_visao_geral(registros_geracao, registros_pld, df_perfil_aneel, params: dict):
+def render_tab_visao_geral(registros_geracao, registros_pld, df_perfil_aneel,
+                           params: dict, registros_coff_eolica=None,
+                           registros_coff_solar=None):
     """Aba de visão geral: KPIs consolidados e ranking de submercados"""
     st.header("📊 Visão Geral")
 
@@ -185,6 +224,8 @@ def render_tab_visao_geral(registros_geracao, registros_pld, df_perfil_aneel, pa
     with st.spinner("Processando análise consolidada de oportunidades..."):
         oportunidades = finder.find_opportunities(
             registros_geracao, registros_pld,
+            registros_coff_eolica=registros_coff_eolica,
+            registros_coff_solar=registros_coff_solar,
             df_perfil_aneel=df_perfil_aneel if not df_perfil_aneel.empty else None,
         )
 
@@ -266,19 +307,66 @@ def render_tab_visao_geral(registros_geracao, registros_pld, df_perfil_aneel, pa
 # ======================================================================
 # ABA 2: CURTAILMENT
 # ======================================================================
-def render_tab_curtailment(registros_geracao, params: dict):
+def render_tab_curtailment(registros_geracao, registros_coff_eolica,
+                           registros_coff_solar, params: dict):
     """Aba de análise detalhada de curtailment"""
     st.header("⚡ Análise de Curtailment")
 
+    registros_coff = registros_coff_eolica + registros_coff_solar
+    analyzer = get_curtailment_analyzer()
+
+    if registros_coff:
+        st.subheader("Dados oficiais de restrição COFF do ONS")
+        st.caption(
+            "Cada registro representa uma usina em um intervalo de 30 minutos. "
+            "A potência restringida é calculada pela diferença positiva entre "
+            "geração estimada e verificada, apenas quando a flag COFF está ativa."
+        )
+        df_coff = analyzer.analyze_curtailment_real(registros_coff)
+        if not df_coff.empty:
+            energia_total = df_coff['energia_cortada_total_mwh'].sum()
+            usinas = len({registro.usina for registro in registros_coff})
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Energia restringida estimada", f"{energia_total:,.0f} MWh")
+            c2.metric("Usinas afetadas", f"{usinas:,.0f}")
+            c3.metric("Registros de 30 min", f"{df_coff['num_registros'].sum():,.0f}")
+            st.dataframe(
+                df_coff,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info(
+                "O ONS publicou dados COFF para o período, mas não há registros "
+                "com flag de restrição e diferença positiva entre geração "
+                "estimada e verificada."
+            )
+    else:
+        st.warning(
+            "Não há registros COFF disponíveis para o período selecionado. "
+            "Sem programação de geração, os CSVs de geração verificada não "
+            "permitem inferir curtailment."
+        )
+
+    tem_curtailment_inferivel = any(
+        registro.curtailment_mw > 0 for registro in registros_geracao
+    )
     if not registros_geracao:
         st.info(
             "ℹ️ Nenhum dado de geração disponível para o período/fontes "
-            "selecionados. Esta análise requer dados de geração programada "
-            "vs. verificada do ONS."
+            "selecionados."
         )
         return
 
-    analyzer = get_curtailment_analyzer()
+    if not tem_curtailment_inferivel:
+        st.info(
+            "A geração programada não está publicada nos registros usados "
+            "nesta análise. Os gráficos inferidos de geração programada versus "
+            "verificada foram omitidos para não apresentar zeros enganosos; "
+            "consulte os dados COFF acima."
+        )
+        return
+
     df_geracao = convert_registros_to_df(registros_geracao)
 
     submercados_disponiveis = sorted(df_geracao['submercado'].unique())
@@ -741,11 +829,18 @@ def main():
         st.stop()
 
     # --- Carregamento centralizado de dados ---
-    registros_geracao, registros_pld, df_perfil_aneel = carregar_dados(params)
+    (
+        registros_geracao,
+        registros_coff_eolica,
+        registros_coff_solar,
+        registros_pld,
+        df_perfil_aneel,
+    ) = carregar_dados(params)
 
     st.success(
         f"✅ Dados carregados: {len(registros_geracao):,} registros de geração, "
-        f"{len(registros_pld):,} registros de PLD."
+        f"{len(registros_pld):,} registros de PLD e "
+        f"{len(registros_coff_eolica) + len(registros_coff_solar):,} registros COFF."
     )
 
     # --- Navegação por abas ---
@@ -759,11 +854,15 @@ def main():
 
     with tab1:
         resultado_visao_geral = render_tab_visao_geral(
-            registros_geracao, registros_pld, df_perfil_aneel, params
+            registros_geracao, registros_pld, df_perfil_aneel, params,
+            registros_coff_eolica, registros_coff_solar,
         )
 
     with tab2:
-        render_tab_curtailment(registros_geracao, params)
+        render_tab_curtailment(
+            registros_geracao, registros_coff_eolica,
+            registros_coff_solar, params,
+        )
 
     with tab3:
         render_tab_spread(registros_pld, params)

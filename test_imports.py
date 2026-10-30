@@ -24,7 +24,10 @@ def test_all_imports():
 
     # Valida enums
     assert TipoFonte.EOLICA.value == "EOLICA"
-    assert TipoRestricao.CURTAILMENT_EOLICO.value == "CURTAILMENT_EOLICO"
+    assert (
+        TipoRestricao.CURTAILMENT_EOLICO_COFF.value
+        == "CURTAILMENT_EOLICO_COFF"
+    )
 
     print("✅ Enums validados corretamente!")
 
@@ -34,6 +37,38 @@ def test_all_imports():
 
     print("✅ Diretórios de infraestrutura validados!")
     print("\n🎉 Smoke test concluído com sucesso - projeto pronto para uso.\n")
+
+
+def test_detect_curtailment_events_with_multiple_sources():
+    from datetime import datetime
+
+    from analysis import CurtailmentAnalyzer
+    from models.data_models import (
+        RazaoRestricaoCOFF,
+        RestricaoCOFF,
+        TipoFonte,
+        TipoRestricao,
+    )
+
+    registros = [
+        RestricaoCOFF(
+            timestamp=datetime(2026, 1, 1),
+            usina="Usina",
+            submercado="SE",
+            fonte=fonte,
+            potencia_restringida_mw=10.0,
+            razao_restricao=RazaoRestricaoCOFF.OUTRA,
+        )
+        for fonte in (TipoFonte.EOLICA, TipoFonte.SOLAR)
+    ]
+
+    eventos = CurtailmentAnalyzer().detect_curtailment_events_real(registros)
+
+    assert len(eventos) == 2
+    assert {evento.tipo for evento in eventos} == {
+        TipoRestricao.CURTAILMENT_EOLICO_COFF,
+        TipoRestricao.CURTAILMENT_SOLAR_COFF,
+    }
 
 
 if __name__ == "__main__":

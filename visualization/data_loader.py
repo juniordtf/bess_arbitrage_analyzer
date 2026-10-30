@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 import logging
 
 from config.settings import Settings
-from models.data_models import RegistroGeracao, RegistroPLD, TipoFonte
+from models.data_models import RegistroGeracao, RegistroPLD, RestricaoCOFF, TipoFonte
 from data_collectors.ons_collector import ONSDataCollector
 from data_collectors.aneel_collector import ANEELDataCollector
 from data_collectors.ccee_collector import CCEEDataCollector, CCEEDatasetUnavailableError
@@ -89,6 +89,23 @@ def load_generation_data(fontes: Tuple[str, ...],
             st.warning(f"⚠️ Não foi possível carregar dados de {fonte_str}: {e}")
 
     return registros
+
+
+@st.cache_data(ttl=3600, show_spinner="Coletando dados de restrição COFF do ONS...")
+def load_coff_data(fonte: str,
+                   data_inicio: datetime,
+                   data_fim: datetime) -> List[RestricaoCOFF]:
+    """Carrega registros oficiais mensais de restrição COFF."""
+    collector = get_ons_collector()
+    fonte_enum = TipoFonte[fonte]
+    try:
+        return collector.get_restricao_coff(fonte_enum, data_inicio, data_fim)
+    except Exception as e:
+        logger.error(f"Erro ao carregar COFF {fonte}: {e}")
+        st.warning(
+            f"⚠️ Não foi possível carregar o dataset COFF de {fonte}: {e}"
+        )
+        return []
 
 
 @st.cache_data(ttl=3600, show_spinner="Coletando dados de PLD do ONS...")

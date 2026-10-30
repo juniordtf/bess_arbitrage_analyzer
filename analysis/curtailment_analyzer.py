@@ -30,7 +30,7 @@ import logging
 from config.settings import Settings
 from models.data_models import (
     RegistroGeracao, RegistroPLD, RestricaoOperativa,
-    TipoFonte, TipoRestricao
+    TipoFonte, TipoRestricao, RazaoRestricaoCOFF, RestricaoCOFF
 )
 
 logger = logging.getLogger(__name__)
@@ -38,27 +38,371 @@ logger = logging.getLogger(__name__)
 
 class CurtailmentAnalyzer:
     """
-    Analisa séries temporais de geração para identificar curtailment
-    e excesso de geração por submercado.
+    Motor de análise de curtailment com hierarquia explícita de
+    confiabilidade de fonte:
+
+    1ª PRIORIDADE (dado real/confirmado):
+       RestricaoCOFF - dataset oficial do ONS com razão de corte
+       classificada por usina/hora. Sempre que disponível, é a
+       ÚNICA fonte usada para reportar "energia de curtailment
+       confirmada".
+
+    2ª PRIORIDADE (inferência física):
+       Comparação geração programada vs. verificada (RegistroGeracao)
+       - usado quando não há dado COFF disponível para o período/fonte.
+
+    3ª PRIORIDADE (proxy econômico, apenas contextual):
+       PLD baixo/zero (RegistroPLD) - NUNCA deve ser reportado como
+       "curtailment confirmado". Serve apenas como indicador de
+       contexto de excesso de oferta no sistema, sinalizado
+       explicitamente como tal em todos os relatórios/gráficos.
     """
+
+    # Threshold mínimo de potência restringida para considerar um
+    # evento relevante (evita ruído de registros com cortes triviais)
+    MIN_POTENCIA_RESTRINGIDA_MW = 1.0
 
     def __init__(self,
                  limiar_curtailment_mw: float = None,
                  limiar_percentual: float = 0.05,
                  limiar_excesso_percentil: float = 10.0):
-        """
-        Args:
-            limiar_curtailment_mw: magnitude mínima (MW) para considerar
-                um evento de curtailment relevante (filtra ruído).
-            limiar_percentual: % mínimo de corte em relação à geração
-                programada para considerar evento relevante.
-            limiar_excesso_percentil: percentil de PLD abaixo do qual
-                consideramos "excesso de geração" (ex.: 10 = PLD nos
-                10% mais baixos do período).
-        """
-        self.limiar_curtailment_mw = limiar_curtailment_mw or Settings.LIMIAR_CURTAILMENT_MW
+        self.limiar_curtailment_mw = (
+            Settings.LIMIAR_CURTAILMENT_MW
+            if limiar_curtailment_mw is None
+            else limiar_curtailment_mw
+        )
         self.limiar_percentual = limiar_percentual
         self.limiar_excesso_percentil = limiar_excesso_percentil
+
+    # ==================================================================
+    # MÉTODO PRINCIPAL - ANÁLISE COM FONTE REAL (COFF)
+    # ==================================================================
+    def analyze_curtailment_real(self,
+                                    registros_coff: List[RestricaoCOFF]) -> pd.DataFrame:
+        """
+        Analisa curtailment REAL a partir do dataset oficial COFF do
+        ONS, agregando por submercado, fonte e razão de restrição.
+
+        Este é o método que deve alimentar qualquer relatório que
+        afirme "houve X MWh de curtailment" - diferente do proxy de
+        PLD, que deve ser sempre rotulado como estimativa indicativa.
+        """
+        if not registros_coff:
+            return pd.DataFrame()
+
+        data = [{
+            'timestamp': r.timestamp,
+            'submercado': r.submercado,
+            'fonte': r.fonte.value,
+            'usina': r.usina,
+            'razao_restricao': r.razao_restricao.value,
+            'potencia_restringida_mw': r.potencia_restringida_mw,
+            'energia_cortada_mwh': r.energia_cortada_mwh,
+        } for r in registros_coff]
+
+        df = pd.DataFrame(data)
+
+        resumo = df.groupby(['submercado', 'fonte', 'razao_restricao']).agg(
+            energia_cortada_total_mwh=('energia_cortada_mwh', 'sum'),
+            num_registros=('energia_cortada_mwh', 'count'),
+            num_usinas_afetadas=('usina', 'nunique'),
+            potencia_media_restringida_mw=('potencia_restringida_mw', 'mean'),
+            potencia_maxima_restringida_mw=('potencia_restringida_mw', 'max'),
+        ).reset_index()
+
+        resumo['fonte_dado'] = 'COFF_REAL'  # flag explícita de confiabilidade
+
+        return resumo.sort_values('energia_cortada_total_mwh', ascending=False)
+
+    def detect_curtailment_events_real(self,
+                                          registros_coff: List[RestricaoCOFF],
+                                          min_duracao_horas: float = 0.5) -> List[RestricaoOperativa]:
+        """
+        Detecta eventos discretos de curtailment a partir do dado REAL
+        COFF, consolidando registros horários consecutivos da mesma
+        usina/razão em um único evento (mesma lógica de agrupamento
+        temporal usada no método legado baseado em programado/verificado,
+        mas agora alimentada por dado confirmado).
+        """
+        if not registros_coff:
+            return []
+
+        df = pd.DataFrame([{
+            'timestamp': r.timestamp,
+            'usina': r.usina,
+            'submercado': r.submercado,
+            'fonte': r.fonte,
+            'potencia_restringida_mw': r.potencia_restringida_mw,
+            'razao_restricao': r.razao_restricao,
+            'intervalo_horas': r.intervalo_horas,
+        } for r in registros_coff])
+
+        df = df[df['potencia_restringida_mw'] >= self.MIN_POTENCIA_RESTRINGIDA_MW]
+        if df.empty:
+            return []
+
+        df = df.sort_values(['usina', 'timestamp'])
+
+        eventos = []
+        for (usina, submercado, fonte, razao), grupo in df.groupby(
+            ['usina', 'submercado', 'fonte', 'razao_restricao'],
+            sort=False,
+        ):
+            grupo = grupo.sort_values('timestamp').reset_index(drop=True)
+            grupo['gap_horas'] = grupo['timestamp'].diff().dt.total_seconds().div(3600).fillna(0)
+            intervalo_anterior = grupo['intervalo_horas'].shift().fillna(
+                grupo['intervalo_horas']
+            )
+            grupo['novo_evento'] = (
+                grupo['gap_horas'] > intervalo_anterior * 1.5
+            ).cumsum()
+
+            for _, sub_grupo in grupo.groupby('novo_evento'):
+                duracao_horas = float(sub_grupo['intervalo_horas'].sum())
+                if duracao_horas < min_duracao_horas:
+                    continue
+
+                razao = RazaoRestricaoCOFF(razao)
+                tipo = self._mapear_razao_para_tipo_restricao(
+                    razao, sub_grupo['fonte'].iloc[0]
+                )
+                energia_cortada_mwh = float(
+                    (
+                        sub_grupo['potencia_restringida_mw']
+                        * sub_grupo['intervalo_horas']
+                    ).sum()
+                )
+                magnitude_media_mw = energia_cortada_mwh / duracao_horas
+
+                eventos.append(RestricaoOperativa(
+                    timestamp=sub_grupo['timestamp'].iloc[0],
+                    submercado=sub_grupo['submercado'].iloc[0],
+                    tipo=tipo,
+                    magnitude_mw=magnitude_media_mw,
+                    duracao_horas=duracao_horas,
+                    descricao=(
+                        f"Curtailment REAL (COFF) confirmado na usina {usina} "
+                        f"por razão {razao.value}, {duracao_horas:g}h consecutivas"
+                    ),
+                ))
+
+        logger.info(f"Detectados {len(eventos)} eventos REAIS de curtailment (fonte COFF)")
+        return eventos
+
+    @staticmethod
+    def _mapear_razao_para_tipo_restricao(razao: RazaoRestricaoCOFF,
+                                              fonte: TipoFonte) -> TipoRestricao:
+        """Mapeia razão oficial COFF + fonte para o enum de tipo de restrição consolidado"""
+        if razao == RazaoRestricaoCOFF.ELETRICA:
+            return TipoRestricao.CURTAILMENT_ELETRICO_COFF
+        if razao == RazaoRestricaoCOFF.ENERGETICA:
+            return TipoRestricao.CURTAILMENT_ENERGETICO_COFF
+        if fonte == TipoFonte.EOLICA:
+            return TipoRestricao.CURTAILMENT_EOLICO_COFF
+        if fonte == TipoFonte.SOLAR:
+            return TipoRestricao.CURTAILMENT_SOLAR_COFF
+        return TipoRestricao.RESTRICAO_TRANSMISSAO
+
+    # ==================================================================
+    # MÉTODO LEGADO - PROXY VIA PLD (APENAS CONTEXTUAL, NUNCA PRIMÁRIO)
+    # ==================================================================
+    def detect_oversupply_events(self,
+                                    registros_pld: List[RegistroPLD],
+                                    percentil_threshold: float = 0.10,
+                                    min_duracao_horas: int = 1) -> List[RestricaoOperativa]:
+        """
+        ⚠️ MÉTODO DE PROXY ECONÔMICO - NÃO CONFUNDIR COM DADO CONFIRMADO.
+
+        Detecta janelas de PLD anormalmente baixo como um INDICADOR
+        INDIRETO de possível excesso de oferta no sistema. Este método
+        NUNCA deve ser usado isoladamente para afirmar "houve
+        curtailment" em relatórios - ele serve apenas como sinal de
+        contexto econômico complementar ao dado real (COFF).
+
+        Motivo técnico: o PLD no Brasil raramente reflete eventos de
+        curtailment por restrição ELÉTRICA (a maioria dos casos reais
+        no NE/SE), pois é um preço de equilíbrio nacional/submercado,
+        não um indicador de restrição local de rede. Mesmo em casos de
+        excesso ENERGÉTICO real, o PLD tem piso regulatório que pode
+        mascarar o evento.
+
+        Todos os eventos retornados por este método carregam o tipo
+        TipoRestricao.EXCESSO_OFERTA_PROXY_PLD, que é tratado de forma
+        visualmente distinta (e com ressalva textual) em todas as
+        camadas de relatório/dashboard.
+        """
+        if not registros_pld:
+            return []
+
+        df = pd.DataFrame([{
+            'timestamp': r.timestamp,
+            'submercado': r.submercado,
+            'pld_mwh': r.pld_mwh,
+        } for r in registros_pld])
+
+        eventos = []
+
+        for submercado, grupo in df.groupby('submercado'):
+            grupo = grupo.sort_values('timestamp').reset_index(drop=True)
+            threshold = grupo['pld_mwh'].quantile(percentil_threshold)
+
+            grupo['abaixo_threshold'] = grupo['pld_mwh'] <= threshold
+            grupo['gap_horas'] = grupo['timestamp'].diff().dt.total_seconds().div(3600).fillna(0)
+            grupo['novo_evento'] = (
+                (~grupo['abaixo_threshold']) | (grupo['gap_horas'] > 1.5)
+            ).cumsum()
+
+            for _, sub_grupo in grupo[grupo['abaixo_threshold']].groupby('novo_evento'):
+                duracao_horas = len(sub_grupo)
+                if duracao_horas < min_duracao_horas:
+                    continue
+
+                eventos.append(RestricaoOperativa(
+                    timestamp=sub_grupo['timestamp'].iloc[0],
+                    submercado=submercado,
+                    tipo=TipoRestricao.EXCESSO_OFERTA_PROXY_PLD,
+                    magnitude_mw=0.0,  # proxy de preço não tem magnitude física confiável
+                    duracao_horas=duracao_horas,
+                    descricao=(
+                        f"⚠️ INDICATIVO (proxy PLD): PLD médio de "
+                        f"R$ {sub_grupo['pld_mwh'].mean():.2f}/MWh "
+                        f"(abaixo do percentil {percentil_threshold*100:.0f}% do período) "
+                        f"por {duracao_horas}h - possível excesso de oferta, "
+                        f"SEM confirmação por dado real de restrição."
+                    ),
+                ))
+
+        logger.info(
+            f"Detectados {len(eventos)} eventos INDICATIVOS via proxy PLD "
+            f"(⚠️ não confirmados por dado real COFF)"
+        )
+        return eventos
+
+    # ==================================================================
+    # CONSOLIDAÇÃO: FUNDE DADO REAL + PROXY, COM RÓTULO DE CONFIABILIDADE
+    # ==================================================================
+    def analyze_curtailment_consolidado(self,
+                                           registros_coff_eolica: Optional[List[RestricaoCOFF]] = None,
+                                           registros_coff_solar: Optional[List[RestricaoCOFF]] = None,
+                                           registros_geracao: Optional[List[RegistroGeracao]] = None,
+                                           registros_pld: Optional[List[RegistroPLD]] = None) -> Dict:
+        """
+        Método orquestrador que aplica a hierarquia de confiabilidade
+        de fonte e retorna um resultado consolidado, SEMPRE explicitando
+        qual fração do resultado vem de dado confirmado vs. indicativo.
+
+        Hierarquia de uso:
+        1. Se há registros_coff (eólica e/ou solar) -> usa como fonte
+           PRIMÁRIA e CONFIRMADA de curtailment.
+        2. Se não há COFF mas há registros_geracao (programado vs.
+           verificado) -> usa como fonte SECUNDÁRIA (inferência física,
+           ainda assim mais confiável que preço).
+        3. registros_pld é SEMPRE processado, mas seus eventos são
+           marcados como indicativos e nunca somados ao total
+           "confirmado" de energia cortada.
+
+        Returns:
+            Dict com:
+            - 'eventos_confirmados': List[RestricaoOperativa] (fonte COFF ou geração)
+            - 'eventos_indicativos_pld': List[RestricaoOperativa] (proxy, sempre separado)
+            - 'fonte_dados_primaria': str ('COFF_REAL' | 'GERACAO_PROGRAMADA_VS_VERIFICADA' | 'NENHUMA')
+            - 'energia_confirmada_total_mwh': float
+            - 'tem_dado_confirmado': bool
+            - 'resumo_por_razao': pd.DataFrame (apenas se fonte COFF disponível)
+        """
+        registros_coff = (registros_coff_eolica or []) + (registros_coff_solar or [])
+
+        eventos_confirmados: List[RestricaoOperativa] = []
+        fonte_primaria = 'NENHUMA'
+        resumo_por_razao = pd.DataFrame()
+
+        if registros_coff:
+            eventos_confirmados = self.detect_curtailment_events_real(registros_coff)
+            resumo_por_razao = self.analyze_curtailment_real(registros_coff)
+            fonte_primaria = 'COFF_REAL'
+
+        elif registros_geracao:
+            eventos_inferidos = self.detect_curtailment_events(registros_geracao)
+            if eventos_inferidos:
+                eventos_confirmados = eventos_inferidos
+                fonte_primaria = 'GERACAO_PROGRAMADA_VS_VERIFICADA'
+
+        if not registros_coff and fonte_primaria == 'GERACAO_PROGRAMADA_VS_VERIFICADA':
+            logger.warning(
+                "Dataset COFF real não disponível - usando inferência via "
+                "geração programada vs. verificada (fonte secundária, "
+                "menos granular que o dado oficial de razão de corte)"
+            )
+        elif not registros_coff and fonte_primaria == 'NENHUMA':
+            logger.warning(
+                "⚠️ NENHUMA fonte confirmada de curtailment disponível "
+                "(nem COFF, nem geração programada/verificada). A análise "
+                "ficará restrita a indicadores de PLD - resultado NÃO deve "
+                "ser reportado como 'ausência de curtailment confirmado', "
+                "mas sim como 'dado confirmado indisponível para o período'."
+            )
+
+        eventos_indicativos_pld = []
+        if registros_pld:
+            eventos_indicativos_pld = self.detect_oversupply_events(registros_pld)
+
+        energia_confirmada_total = sum(
+            e.magnitude_mw * e.duracao_horas for e in eventos_confirmados
+        )
+
+        return {
+            'eventos_confirmados': eventos_confirmados,
+            'eventos_indicativos_pld': eventos_indicativos_pld,
+            'fonte_dados_primaria': fonte_primaria,
+            'energia_confirmada_total_mwh': round(energia_confirmada_total, 1),
+            'tem_dado_confirmado': fonte_primaria != 'NENHUMA',
+            'resumo_por_razao': resumo_por_razao,
+        }
+
+    def gerar_aviso_transparencia(self, resultado_consolidado: Dict) -> str:
+        """
+        Gera texto de aviso padronizado para exibição em relatórios/
+        dashboard, deixando explícita a origem e confiabilidade dos
+        dados apresentados - requisito direto levantado na revisão
+        deste módulo (evitar "estranheza" por falsos negativos).
+        """
+        fonte = resultado_consolidado['fonte_dados_primaria']
+        tem_confirmado = resultado_consolidado['tem_dado_confirmado']
+        n_indicativos = len(resultado_consolidado['eventos_indicativos_pld'])
+
+        if fonte == 'COFF_REAL':
+            return (
+                "✅ Dados de curtailment baseados no dataset OFICIAL de "
+                "Restrição COFF do ONS (granularidade de 30 minutos por "
+                "usina). A potência restringida é estimada pela diferença "
+                "entre geração estimada e verificada, e a razão é exibida "
+                "quando publicada pelo ONS."
+            )
+        elif fonte == 'GERACAO_PROGRAMADA_VS_VERIFICADA':
+            return (
+                "⚠️ Dataset oficial de Restrição COFF indisponível para o "
+                "período. Curtailment estimado por inferência física "
+                "(geração programada vs. verificada) - método mais "
+                "confiável que proxy de preço, porém sem classificação "
+                "oficial de razão de corte."
+            )
+        else:
+            aviso = (
+                "❌ ATENÇÃO: nenhuma fonte confirmada de curtailment "
+                "(COFF ou geração programada/verificada) estava disponível "
+                "para o período analisado. A ausência de eventos "
+                "confirmados NÃO significa ausência de curtailment real - "
+                "significa apenas que o dado não pôde ser obtido."
+            )
+            if n_indicativos > 0:
+                aviso += (
+                    f" Foram identificados {n_indicativos} eventos "
+                    f"INDICATIVOS via proxy de PLD baixo, que sugerem "
+                    f"possível excesso de oferta, mas que requerem "
+                    f"validação com dado oficial antes de qualquer "
+                    f"conclusão definitiva."
+                )
+            return aviso
 
     # ------------------------------------------------------------------
     # Construção do DataFrame base
@@ -251,14 +595,8 @@ class CurtailmentAnalyzer:
 
     @staticmethod
     def _classificar_tipo_restricao(fonte: str) -> TipoRestricao:
-        """Mapeia fonte para o tipo de restrição correspondente"""
-        mapping = {
-            'EOLICA': TipoRestricao.CURTAILMENT_EOLICO,
-            'SOLAR': TipoRestricao.CURTAILMENT_SOLAR,
-            'HIDRAULICA': TipoRestricao.EXCESSO_HIDRICO,
-            'TERMICA': TipoRestricao.SOBRA_TERMICA,
-        }
-        return mapping.get(fonte.upper(), TipoRestricao.RESTRICAO_TRANSMISSAO)
+        """Classifica eventos inferidos sem marcá-los como dados COFF confirmados."""
+        return TipoRestricao.RESTRICAO_TRANSMISSAO
 
     # ------------------------------------------------------------------
     # Padrões temporais (sazonalidade, horário do dia)
@@ -414,67 +752,6 @@ class CurtailmentAnalyzer:
             return pd.DataFrame()
 
         return pd.concat(resultados, ignore_index=True)
-
-    def detect_oversupply_events(self,
-                                   registros_pld: List[RegistroPLD],
-                                   min_duracao_horas: int = 2) -> List[RestricaoOperativa]:
-        """
-        Detecta eventos discretos de excesso de geração (PLD muito baixo
-        de forma sustentada), análogos aos eventos de curtailment.
-        """
-        if not registros_pld:
-            return []
-
-        data = [{
-            'timestamp': r.timestamp,
-            'submercado': r.submercado,
-            'pld_mwh': r.pld_mwh,
-        } for r in registros_pld]
-
-        df = pd.DataFrame(data)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-        eventos = []
-
-        for submercado, grupo in df.groupby('submercado'):
-            grupo = grupo.sort_values('timestamp').reset_index(drop=True)
-            percentil_baixo = np.percentile(
-                grupo['pld_mwh'], self.limiar_excesso_percentil
-            )
-
-            grupo['em_excesso'] = grupo['pld_mwh'] <= percentil_baixo
-            grupo['bloco'] = (
-                grupo['em_excesso'] != grupo['em_excesso'].shift()
-            ).cumsum()
-
-            for bloco_id, bloco_df in grupo.groupby('bloco'):
-                if not bloco_df['em_excesso'].iloc[0]:
-                    continue
-
-                duracao_horas = len(bloco_df)
-                if duracao_horas < min_duracao_horas:
-                    continue
-
-                timestamp_inicio = bloco_df['timestamp'].iloc[0]
-                pld_medio = bloco_df['pld_mwh'].mean()
-
-                evento = RestricaoOperativa(
-                    timestamp=timestamp_inicio,
-                    submercado=submercado,
-                    tipo=TipoRestricao.EXCESSO_HIDRICO,  # proxy genérico
-                    magnitude_mw=0.0,  # não há magnitude física direta via PLD
-                    duracao_horas=duracao_horas,
-                    custo_oportunidade_rs=None,
-                    descricao=(
-                        f"Excesso de geração em {submercado}: "
-                        f"PLD médio R$ {pld_medio:.2f}/MWh por {duracao_horas}h "
-                        f"(início {timestamp_inicio.strftime('%Y-%m-%d %H:%M')})"
-                    )
-                )
-                eventos.append(evento)
-
-        logger.info(f"Detectados {len(eventos)} eventos de excesso de geração via PLD")
-        return eventos
 
     # ------------------------------------------------------------------
     # Ranking consolidado por submercado

@@ -27,8 +27,8 @@ from pathlib import Path
 
 from config.settings import Settings
 from models.data_models import (
-    RegistroGeracao, RegistroPLD, RestricaoOperativa,
-    OportunidadeBESS, TipoFonte, TipoRestricao
+    RegistroGeracao, RegistroPLD, RestricaoCOFF, RestricaoOperativa,
+    OportunidadeBESS, TipoRestricao
 )
 from analysis.curtailment_analyzer import CurtailmentAnalyzer
 from analysis.price_spread_analyzer import PriceSpreadAnalyzer
@@ -72,180 +72,201 @@ class BESSOpportunityFinder:
     # MÉTODO PRINCIPAL
     # ==================================================================
     def find_opportunities(self,
-                            registros_geracao: List[RegistroGeracao],
-                            registros_pld: List[RegistroPLD],
-                            df_perfil_aneel: Optional[pd.DataFrame] = None,
-                            min_score_corte: float = 0.0) -> List[OportunidadeBESS]:
+                              registros_geracao: List[RegistroGeracao],
+                              registros_pld: List[RegistroPLD],
+                              registros_coff_eolica: Optional[List[RestricaoCOFF]] = None,
+                              registros_coff_solar: Optional[List[RestricaoCOFF]] = None,
+                              df_perfil_aneel: Optional[pd.DataFrame] = None,
+                              min_score_corte: float = 0.0) -> List[OportunidadeBESS]:
         """
-        Gera a lista consolidada de oportunidades de BESS, uma por
-        submercado (podendo ser estendido para granularidade por fonte).
+        VERSÃO ATUALIZADA: agora recebe (opcionalmente) os dados reais
+        de restrição COFF, priorizando-os sobre a inferência via
+        geração programada/verificada e sobre o proxy de PLD.
+
+        Caso registros_coff_* não sejam fornecidos, o comportamento
+        legado é mantido (fallback para geração programada/verificada,
+        com PLD apenas como contexto) - garantindo compatibilidade
+        retroativa com chamadas existentes do pipeline/dashboard.
 
         Args:
-            registros_geracao: dados de geração (ONS) para análise de curtailment
-            registros_pld: dados de PLD (ONS) para análise de spread
-            df_perfil_aneel: perfil opcional de saturação de mercado (ANEEL)
-            min_score_corte: filtra oportunidades com score abaixo deste valor
-
-        Returns:
-            Lista de OportunidadeBESS ordenada por score_atratividade (desc)
+            registros_geracao: dados de geração programada/verificada (fallback)
+            registros_pld: dados de PLD (sempre usado para precificação do spread,
+                            e como sinal indicativo complementar de curtailment)
+            registros_coff_eolica: dados REAIS de restrição COFF para eólica (prioritário)
+            registros_coff_solar: dados REAIS de restrição COFF para solar (prioritário)
+            df_perfil_aneel: perfil de saturação de mercado (opcional)
+            min_score_corte: score mínimo para incluir a oportunidade no resultado final
         """
-        oportunidades = []
-
-        submercados_disponiveis = self._identificar_submercados(
-            registros_geracao, registros_pld
+        resultado_curtailment = self.curtailment_analyzer.analyze_curtailment_consolidado(
+            registros_coff_eolica=registros_coff_eolica,
+            registros_coff_solar=registros_coff_solar,
+            registros_geracao=registros_geracao,
+            registros_pld=registros_pld,
         )
 
-        for submercado in submercados_disponiveis:
-            try:
-                oportunidade = self._analisar_submercado(
-                    submercado, registros_geracao, registros_pld, df_perfil_aneel
-                )
-                if oportunidade and oportunidade.score_atratividade >= min_score_corte:
-                    oportunidades.append(oportunidade)
+        aviso_transparencia = self.curtailment_analyzer.gerar_aviso_transparencia(
+            resultado_curtailment
+        )
+        logger.info(f"Fonte de dados de curtailment: {aviso_transparencia}")
 
-            except Exception as e:
-                logger.error(f"Erro ao analisar submercado {submercado}: {e}", exc_info=True)
-                continue
+        if not resultado_curtailment['tem_dado_confirmado']:
+            logger.warning(
+                "Nenhuma oportunidade será dimensionada com base em energia "
+                "'confirmada' - apenas eventos indicativos (proxy PLD) estão "
+                "disponíveis. As oportunidades geradas, se houver, carregarão "
+                "a flag 'dados_confirmados=False' para transparência."
+            )
+
+        submercados_disponiveis = set(r.submercado for r in registros_pld)
+        oportunidades = []
+
+        for submercado in sorted(submercados_disponiveis):
+            oportunidade = self._analisar_submercado(
+                submercado=submercado,
+                resultado_curtailment=resultado_curtailment,
+                registros_pld=registros_pld,
+                df_perfil_aneel=df_perfil_aneel,
+            )
+
+            if oportunidade and oportunidade.score_atratividade >= min_score_corte:
+                oportunidades.append(oportunidade)
 
         oportunidades.sort(key=lambda o: o.score_atratividade, reverse=True)
 
-        logger.info(f"Encontradas {len(oportunidades)} oportunidades de BESS")
+        logger.info(
+            f"{len(oportunidades)} oportunidades identificadas "
+            f"(fonte primária de curtailment: {resultado_curtailment['fonte_dados_primaria']})"
+        )
+
         return oportunidades
 
-    @staticmethod
-    def _identificar_submercados(registros_geracao: List[RegistroGeracao],
-                                   registros_pld: List[RegistroPLD]) -> List[str]:
-        """Identifica submercados presentes nos dados, com fallback para Settings"""
-        submercados = set()
-
-        for r in registros_geracao:
-            submercados.add(r.submercado)
-        for r in registros_pld:
-            submercados.add(r.submercado)
-
-        if not submercados:
-            return Settings.SUBMERCADOS
-
-        return sorted(submercados.intersection(set(Settings.SUBMERCADOS)) or submercados)
-
-    # ==================================================================
-    # ANÁLISE POR SUBMERCADO
-    # ==================================================================
     def _analisar_submercado(self,
-                               submercado: str,
-                               registros_geracao: List[RegistroGeracao],
-                               registros_pld: List[RegistroPLD],
-                               df_perfil_aneel: Optional[pd.DataFrame]) -> Optional[OportunidadeBESS]:
-        """Consolida curtailment + spread + contexto de mercado para um submercado"""
+                                submercado: str,
+                                resultado_curtailment: Dict,
+                                registros_pld: List[RegistroPLD],
+                                df_perfil_aneel: Optional[pd.DataFrame]) -> Optional[OportunidadeBESS]:
+        """
+        VERSÃO ATUALIZADA: separa energia CONFIRMADA (COFF ou geração)
+        de energia INDICATIVA (proxy PLD) no dimensionamento, e marca
+        explicitamente na OportunidadeBESS qual fração do dado é
+        confiável - informação essencial para quem for tomar decisão
+        de investimento com base no relatório.
+        """
+        eventos_confirmados_sub = [
+            e for e in resultado_curtailment['eventos_confirmados']
+            if e.submercado == submercado
+        ]
+        eventos_indicativos_sub = [
+            e for e in resultado_curtailment['eventos_indicativos_pld']
+            if e.submercado == submercado
+        ]
 
-        registros_geracao_sub = [r for r in registros_geracao if r.submercado == submercado]
+        tem_dado_confirmado_sub = len(eventos_confirmados_sub) > 0
+
+        # Usa dado confirmado se disponível; caso contrário, cai para
+        # indicativo MAS sinaliza isso explicitamente na oportunidade
+        eventos_para_dimensionamento = (
+            eventos_confirmados_sub if tem_dado_confirmado_sub
+            else eventos_indicativos_sub
+        )
+
+        if not eventos_para_dimensionamento:
+            logger.debug(f"Nenhum evento de curtailment para {submercado} - pulando")
+            return None
+
         registros_pld_sub = [r for r in registros_pld if r.submercado == submercado]
-
         if not registros_pld_sub:
-            logger.warning(f"Sem dados de PLD para {submercado} - pulando análise")
             return None
 
-        # --- 1. Análise de curtailment (energia disponível) ---
-        eventos_curtailment = []
-        if registros_geracao_sub:
-            eventos_curtailment = self.curtailment_analyzer.detect_curtailment_events(
-                registros_geracao_sub
-            )
-
-        eventos_oversupply = self.curtailment_analyzer.detect_oversupply_events(
-            registros_pld_sub
-        )
-
-        tipo_restricao_predominante = self._identificar_restricao_predominante(
-            eventos_curtailment, eventos_oversupply
-        )
-
-        energia_disponivel_mwh = self._calcular_energia_disponivel(
-            eventos_curtailment, eventos_oversupply
-        )
-
-        # analysis/bess_opportunity_finder.py (continuação)
-
-        # --- 2. Análise de spread (remuneração) ---
-        janelas = self.spread_analyzer.identify_optimal_windows(
-            registros_pld_sub, submercado
-        )
-
+        janelas = self.spread_analyzer.identify_optimal_windows(registros_pld_sub, submercado)
         if not janelas:
-            logger.warning(f"Não foi possível identificar janelas de spread para {submercado}")
             return None
 
-        preco_medio_carga = janelas['janela_carga']['pld_medio']
-        preco_medio_descarga = janelas['janela_descarga']['pld_medio']
-        spread_bruto = janelas['spread_bruto_rs_mwh']
-        spread_liquido = janelas['spread_liquido_rs_mwh']
-
-        volatilidade_preco = self._calcular_volatilidade(registros_pld_sub)
-
-        periodo_inicio, periodo_fim = self._extrair_periodo(
-            registros_geracao_sub, registros_pld_sub
+        energia_disponivel_mwh = sum(
+            e.magnitude_mw * e.duracao_horas for e in eventos_para_dimensionamento
         )
 
-        # --- 3. Dimensionamento técnico recomendado ---
+        if energia_disponivel_mwh <= 0:
+            return None
+
+        janela_carga = janelas['janela_carga']
+        duracao_janela_carga = (
+            janela_carga['hora_fim'] - janela_carga['hora_inicio']
+        ) % 24 + 1
         capacidade_mwh, potencia_mw = self._dimensionar_bess(
-            energia_disponivel_mwh=energia_disponivel_mwh,
-            eventos_curtailment=eventos_curtailment,
-            eventos_oversupply=eventos_oversupply,
-            duracao_janela_carga=janelas['janela_carga']['duracao_horas'],
+            energia_disponivel_mwh,
+            eventos_confirmados_sub,
+            eventos_indicativos_sub,
+            duracao_janela_carga,
         )
 
-        if capacidade_mwh <= 0:
-            logger.info(f"Dimensionamento inviável para {submercado} - sem energia/spread suficiente")
-            return None
-
-        # --- 4. Simulação econômica (backtest real com dimensionamento sugerido) ---
-        df_simulacao = self.spread_analyzer.simulate_arbitrage_operation(
-            registros_pld_sub, submercado, capacidade_mwh, potencia_mw,
-            estrategia='janela_fixa'
+        periodo_dias = max(
+            1.0,
+            (
+                max(r.timestamp for r in registros_pld_sub)
+                - min(r.timestamp for r in registros_pld_sub)
+            ).total_seconds() / 86400 + 1,
+        )
+        num_ciclos_possiveis = self._estimar_ciclos_possiveis(
+            eventos_para_dimensionamento, capacidade_mwh, periodo_dias
         )
 
-        metricas_simulacao = self.spread_analyzer.calculate_simulation_metrics(
-            df_simulacao, capacidade_mwh
-        )
+        spread_liquido = janelas['spread_liquido_rs_mwh']
+        receita_anual_rs = min(
+            energia_disponivel_mwh, capacidade_mwh * num_ciclos_possiveis
+        ) * spread_liquido
 
-        receita_estimada_anual = metricas_simulacao.get('receita_anualizada_rs', 0.0)
-        num_ciclos_possiveis = metricas_simulacao.get('ciclos_equivalentes_anualizados', 0.0)
-
-        # --- 5. Análise financeira (CAPEX, payback) ---
         capex_total, payback_anos = self._calcular_financeiro(
-            capacidade_mwh, potencia_mw, receita_estimada_anual
+            capacidade_mwh, potencia_mw, receita_anual_rs
         )
 
-        # --- 6. Ajuste de saturação de mercado (ANEEL) ---
         fator_saturacao = self._calcular_fator_saturacao(submercado, df_perfil_aneel)
 
-        # --- 7. Score de atratividade consolidado ---
+        volatilidade = pd.Series(
+            [r.pld_mwh for r in registros_pld_sub]
+        ).std()
+
         score = self._calcular_score_atratividade(
-            energia_disponivel_mwh=energia_disponivel_mwh,
-            spread_liquido=spread_liquido,
-            volatilidade_preco=volatilidade_preco,
-            payback_anos=payback_anos,
-            fator_saturacao=fator_saturacao,
-            num_ciclos_possiveis=num_ciclos_possiveis,
+            energia_disponivel_mwh, spread_liquido, volatilidade,
+            payback_anos, fator_saturacao, num_ciclos_possiveis
         )
+
+        tipo_restricao_predominante = self._identificar_tipo_predominante(
+            eventos_para_dimensionamento
+        )
+
+        timestamps = [e.timestamp for e in eventos_para_dimensionamento]
 
         return OportunidadeBESS(
             submercado=submercado,
-            periodo_inicio=periodo_inicio,
-            periodo_fim=periodo_fim,
+            periodo_inicio=min(timestamps),
+            periodo_fim=max(timestamps),
             tipo_restricao=tipo_restricao_predominante,
-            energia_disponivel_mwh=round(energia_disponivel_mwh, 2),
-            preco_medio_carga_rs_mwh=round(preco_medio_carga, 2),
-            preco_medio_descarga_rs_mwh=round(preco_medio_descarga, 2),
-            spread_medio_rs_mwh=round(spread_bruto, 2),
-            volatilidade_preco=round(volatilidade_preco, 2),
-            num_ciclos_possiveis=round(num_ciclos_possiveis, 1),
-            receita_estimada_anual_rs=round(receita_estimada_anual, 2),
+            energia_disponivel_mwh=round(energia_disponivel_mwh, 1),
+            preco_medio_carga_rs_mwh=janelas['janela_carga']['pld_medio'],
+            preco_medio_descarga_rs_mwh=janelas['janela_descarga']['pld_medio'],
+            spread_medio_rs_mwh=spread_liquido,
+            volatilidade_preco=round(volatilidade, 2),
+            num_ciclos_possiveis=round(num_ciclos_possiveis, 0),
+            receita_estimada_anual_rs=round(receita_anual_rs, 2),
             capacidade_recomendada_mwh=round(capacidade_mwh, 1),
             potencia_recomendada_mw=round(potencia_mw, 1),
             payback_anos=round(payback_anos, 1) if payback_anos else None,
-            score_atratividade=round(score, 2),
+            score_atratividade=round(score, 1),
+            dados_confirmados=tem_dado_confirmado_sub,  # NOVO CAMPO - transparência
         )
+
+    @staticmethod
+    def _identificar_tipo_predominante(eventos: List) -> TipoRestricao:
+        """Identifica o tipo de restrição mais frequente entre os eventos analisados"""
+        if not eventos:
+            return TipoRestricao.EXCESSO_OFERTA_PROXY_PLD
+
+        contagem = {}
+        for e in eventos:
+            contagem[e.tipo] = contagem.get(e.tipo, 0) + 1
+
+        return max(contagem, key=contagem.get)
 
     # ==================================================================
     # DETERMINAÇÃO DO TIPO DE RESTRIÇÃO PREDOMINANTE
@@ -377,6 +398,22 @@ class BESSOpportunityFinder:
         )
 
         return capacidade_mwh, potencia_mw
+
+    @staticmethod
+    def _estimar_ciclos_possiveis(
+            eventos: List[RestricaoOperativa],
+            capacidade_mwh: float,
+            periodo_dias: float) -> float:
+        """Annualizes equivalent full cycles from event energy and data coverage."""
+        if capacidade_mwh <= 0 or periodo_dias <= 0:
+            return 0.0
+
+        energia_disponivel_mwh = sum(
+            max(evento.magnitude_mw, 0) * max(evento.duracao_horas, 0)
+            for evento in eventos
+        )
+        ciclos_no_periodo = energia_disponivel_mwh / capacidade_mwh
+        return ciclos_no_periodo * 365 / periodo_dias
 
     @staticmethod
     def _arredondar_para_padrao(valor: float, opcoes_padrao: List[float]) -> float:
